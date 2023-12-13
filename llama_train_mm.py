@@ -204,13 +204,12 @@ if __name__ == '__main__':
     # Initialize base model.
     tokenizer = LlamaTokenizer.from_pretrained(base_model, trust_remote_code=True)
     llama_model = LlamaForCausalLM.from_pretrained(base_model, trust_remote_code=True, revision='main',
-                                                   device_map='auto', load_in_8bit=True)
+                                                   device_map='auto')
 
     # Initialize lora model.
     peft_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM, inference_mode=False, r=16, lora_alpha=32, lora_dropout=0.1
     )
-    llama_model = prepare_model_for_int8_training(llama_model)
     llama_model = get_peft_model(llama_model, peft_config)
 
     # Initialize vision-language model.
