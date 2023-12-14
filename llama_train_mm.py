@@ -1,6 +1,5 @@
 import pickle
 import random
-from typing import Dict
 
 import torch
 import torch.nn as nn
@@ -11,6 +10,7 @@ from einops.layers.torch import Rearrange
 import evaluate
 from transformers import TrainingArguments, Trainer, LlamaTokenizer, LlamaForCausalLM
 from peft import get_peft_model, LoraConfig, TaskType, PeftModel, prepare_model_for_int8_training
+from transformers import TrainerCallback
 
 random.seed(0)
 
@@ -72,11 +72,17 @@ class GoMMDataset(Dataset):
 class ModifiedTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False):
         if return_outputs:
-            outputs = model(inputs)
+            outputs = model(**inputs)
             return outputs.loss, outputs
 
-        outputs = model(inputs)
+        outputs = model(**inputs)
         return outputs.loss
+
+
+class EvaluateFirstStepCallback(TrainerCallback):
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step == 1:
+            control.should_evaluate = True
 
 
 def compute_metrics(pred):
@@ -116,6 +122,10 @@ def compute_metrics(pred):
 
 
 def preprocess_logits_for_metrics(logits, labels):
+    """
+    Original Trainer may have a memory leak.
+    This is a workaround to avoid storing too many tensors that are not needed.
+    """
     logits = logits[0]
     pred_ids = torch.argmax(logits, dim=-1)
     return pred_ids, labels
@@ -125,15 +135,44 @@ def prepare_dataset(tokenizer):
     with open(f'dataset.pkl', 'rb') as f:
         data = pickle.load(f)
 
-    # Split dataset.
     train_data = data[:-int(len(data) / 5)]
     test_data = data[-int(len(data) / 5):]
 
     return GoMMDataset(train_data, tokenizer), GoMMDataset(test_data, tokenizer)
 
 
+def collate_fn(batch):
+    bsz = len(batch)
+    vision_t = (IMG_SIZE // PATCH_SIZE) * (IMG_SIZE // PATCH_SIZE)
+
+    seq_lens = [batch[i]['pre_prompt'].shape[1] + batch[i]['post_prompt'].shape[1]
+                + batch[i]['expl'].shape[1] + vision_t for i in range(bsz)]
+    max_len = max(seq_lens)
+
+    res = {'pre_prompt': [], 'post_prompt': [], 'expl': [], 'image': [], 'labels': []}
+    for i in range(bsz):
+        if seq_lens[i] < max_len:
+            paddings = batch[i]['pre_prompt'].new_full((1, max_len - seq_lens[i]), 0)
+            res['pre_prompt'].append(torch.cat([paddings, batch[i]['pre_prompt']], dim=1))
+        else:
+            res['pre_prompt'].append(batch[i]['pre_prompt'])
+        res['post_prompt'].append(batch[i]['post_prompt'])
+        res['expl'].append(batch[i]['expl'])
+        res['image'].append(batch[i]['image'])
+
+        label_mask = res['expl'][-1].new_full(
+            (res['pre_prompt'][-1].shape[1] + vision_t + res['post_prompt'][-1].shape[1],), -100
+        )
+        res['labels'].append(torch.cat([label_mask, res['expl'][-1].squeeze(0)], dim=0))
+    res['labels'] = torch.stack(res['labels'], dim=0)
+    res['image'] = torch.stack(res['image'], dim=0)
+
+    labels = res.pop('labels')
+    return {'inputs': res, 'labels': labels}
+
+
 class VisionLanguageModel(nn.Module):
-    def __init__(self, language_model, lm_tokenizer, vision_model=None, patch_size=16, img_size=224):
+    def __init__(self, language_model, lm_tokenizer, vision_model=None, patch_size=32, img_size=224):
         super(VisionLanguageModel, self).__init__()
         self.language_model = language_model
         self.tokenizer = lm_tokenizer
@@ -148,58 +187,31 @@ class VisionLanguageModel(nn.Module):
                 nn.Linear(patch_size * patch_size, self.language_model.config.hidden_size)
             )
 
-    def _collate_fn(self, batch):
-        # Collate data in the same batch.
-        bsz = len(batch)
-        x, y = [], []
-        for i in range(bsz):
-            x.append(batch[i]['inputs_embeds'])
-            y.append(batch[i]['labels'])
-        return {'inputs_embeds': torch.stack(x, dim=0), 'labels': torch.stack(y, dim=0)}
-
-    def forward(self, inputs):
-        # (B, T, 4096)
-        if isinstance(inputs, Dict):
-            inputs = inputs['inputs']
-        bsz = len(inputs)
-        vision_embeds = self.vision_model(torch.stack([inputs[i]['image'] for i in range(bsz)]))
-        vision_t = vision_embeds.shape[1]
-        seq_lens = [inputs[i]['pre_prompt'].shape[1] + inputs[i]['post_prompt'].shape[1]
-                    + inputs[i]['expl'].shape[1] + vision_t for i in range(bsz)]
-        max_len = max(seq_lens)
-
+    def forward(self, inputs, labels):
+        bsz = inputs['image'].shape[0]
+        vision_embeds = self.vision_model(inputs['image'])
         embedded_inputs = []
         for i in range(bsz):
-            # Pad the sequence into the same length.
-            # Left-padding is used.
-            if seq_lens[i] < max_len:
-                paddings = inputs[i]['pre_prompt'].new_full(
-                    (1, max_len - seq_lens[i]), 0
-                )
-                inputs[i]['pre_prompt'] = torch.cat([paddings, inputs[i]['pre_prompt']], dim=1)
-
             # language_model: peft model; language_model.model: LlamaForCausalLM; language_model.model: LlamaModel
-            pre_embed = self.language_model.model.model.embed_tokens(inputs[i]['pre_prompt']).squeeze(0)
-            post_embed = self.language_model.model.model.embed_tokens(inputs[i]['post_prompt']).squeeze(0)
-            expl_embed = self.language_model.model.model.embed_tokens(inputs[i]['expl']).squeeze(0)
+            pre_embed = self.language_model.model.model.embed_tokens(inputs['pre_prompt'][i]).squeeze(0)
+            post_embed = self.language_model.model.model.embed_tokens(inputs['post_prompt'][i]).squeeze(0)
+            expl_embed = self.language_model.model.model.embed_tokens(inputs['expl'][i]).squeeze(0)
 
-            # -100 means that this index is ignored when training.
-            label = inputs[i]['expl'].new_full(
-                (pre_embed.shape[0] + vision_embeds[i].shape[0] + post_embed.shape[0],), -100
-            )
-            embedded_inputs.append({
-                'inputs_embeds': torch.cat([pre_embed, vision_embeds[i], post_embed, expl_embed], dim=0),
-                'labels': torch.cat([label, inputs[i]['expl'].squeeze(0)], dim=0)
-            })
+            embedded_inputs.append(torch.cat([pre_embed, vision_embeds[i], post_embed, expl_embed], dim=0))
 
-        embedded_inputs = self._collate_fn(embedded_inputs)
-        return self.language_model(**embedded_inputs)
+        model_inputs = {
+            'inputs_embeds': torch.stack(embedded_inputs, dim=0),
+            'labels': labels
+        }
+        return self.language_model(**model_inputs)
 
 
 if __name__ == '__main__':
     # Initialize base model.
     base_model = '/mnt/nfs/whl/LLM/llama-2-7b-hf'
     MODE = 'mm'
+    IMG_SIZE = 224
+    PATCH_SIZE = 32
 
     # Initialize base model.
     tokenizer = LlamaTokenizer.from_pretrained(base_model, trust_remote_code=True)
@@ -212,8 +224,8 @@ if __name__ == '__main__':
     )
     llama_model = get_peft_model(llama_model, peft_config)
 
-    # Initialize vision-language model.
-    model = VisionLanguageModel(language_model=llama_model, lm_tokenizer=tokenizer).cuda()
+    model = VisionLanguageModel(language_model=llama_model, lm_tokenizer=tokenizer,
+                                img_size=IMG_SIZE, patch_size=PATCH_SIZE).cuda()
     print(model)
     llama_model.print_trainable_parameters()
 
@@ -240,11 +252,9 @@ if __name__ == '__main__':
         bf16=True,
         tf32=True
     )
-
-    # Trainer
     trainer = ModifiedTrainer(
         model=model,
-        data_collator=lambda x: {'inputs': x},
+        data_collator=collate_fn,
         train_dataset=train_dataset,
         eval_dataset=test_dataset,
         args=training_args,
@@ -252,4 +262,6 @@ if __name__ == '__main__':
         preprocess_logits_for_metrics=preprocess_logits_for_metrics
     )
 
+    # Resume from the checkpoint
+    trainer.add_callback(EvaluateFirstStepCallback())
     trainer.train()
