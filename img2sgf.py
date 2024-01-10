@@ -46,7 +46,7 @@ def get_nearest(from_px: float, to_px: float, interval: float):
     return res
 
 
-def get_estimated_center(orig_est_x: float, orig_est_y: float, points: List, radius: float):
+def get_estimated_center(orig_est_x: float, orig_est_y: float, points: List, radius: float, momentum=0.99):
     """
         Given the original estimated x and y, get a refined coordination which is aligned to the centers of
     detected circles.
@@ -59,7 +59,27 @@ def get_estimated_center(orig_est_x: float, orig_est_y: float, points: List, rad
         est_x += dist * get_nearest(from_px=px, to_px=orig_est_x, interval=2 * radius)
         est_y += dist * get_nearest(from_px=py, to_px=orig_est_y, interval=2 * radius)
         total_distance += dist
-    return int(est_x / total_distance), int(est_y / total_distance)
+    res_x = momentum * orig_est_x + (1 - momentum) * (est_x / total_distance)
+    res_y = momentum * orig_est_y + (1 - momentum) * (est_y / total_distance)
+    return int(res_x), int(res_y)
+
+
+def estimate_radius(circles: List) -> float:
+    """
+        Estimate the radius of stones using the detected circles.
+    """
+    rounded_circles = np.uint16(np.around(circles))
+    rounded_circles = rounded_circles.tolist()
+    rounded_circles.sort(key=lambda x: x[2])
+    radius_tot = [cir[2] for cir in rounded_circles]
+    radius = max(radius_tot, key=radius_tot.count)
+
+    recomputed_radius = []
+    for cir in circles:
+        if abs(cir[2] - radius) <= 2:
+            recomputed_radius.append(cir[2])
+    radius = sum(recomputed_radius) / len(recomputed_radius)
+    return radius
 
 
 def patchify(checkerboard: np.ndarray) -> List:
@@ -68,7 +88,7 @@ def patchify(checkerboard: np.ndarray) -> List:
     """
     gray = cv2.cvtColor(checkerboard, cv2.COLOR_BGR2GRAY)
     gauss = cv2.GaussianBlur(gray, (5, 5), 0)
-    max_radius = min(gauss.shape) // 19
+    max_radius = 30  # TODO: improvements?
 
     # Detect circles in the input image.
     circles = cv2.HoughCircles(
@@ -81,11 +101,14 @@ def patchify(checkerboard: np.ndarray) -> List:
         maxRadius=max_radius
     )[0]
 
+    # Estimate radius using the detected circles.
+    est_radius = estimate_radius(circles)
+
     # Search an optimal estimated board width using the centers of the detected circles.
-    min_board_width = min(checkerboard.shape[:2]) / 20
-    max_board_width = min(checkerboard.shape[:2]) / 18
-    x_min = min([circles[i][0] for i in range(len(circles))])
-    y_min = min([circles[i][1] for i in range(len(circles))])
+    min_board_width = 2 * est_radius - 5
+    max_board_width = 2 * est_radius + 5
+    x_min = min([circles[i][1] for i in range(len(circles))])
+    y_min = min([circles[i][0] for i in range(len(circles))])
 
     best_board_width = -1
     best_error = 100000
@@ -95,8 +118,8 @@ def patchify(checkerboard: np.ndarray) -> List:
     while bw < max_board_width:
         cur_error = 0
         for cir in circles:
-            cur_error += get_nearest(x_min, cir[0], bw)
-            cur_error += get_nearest(y_min, cir[1], bw)
+            cur_error += get_nearest(x_min, cir[1], bw)
+            cur_error += get_nearest(y_min, cir[0], bw)
         if cur_error < best_error:
             best_error = cur_error
             best_board_width = bw
@@ -106,15 +129,16 @@ def patchify(checkerboard: np.ndarray) -> List:
     estimated_points = []
     started_points = []
     for cir in circles:
-        x_tmp, y_tmp = cir[0], cir[1]
-        estimated_points.append([x_tmp, y_tmp])
-        while x_tmp - best_board_width > 0:
-            x_tmp -= best_board_width
+        x_tmp, y_tmp = cir[1], cir[0]
+        if abs(est_radius - cir[2]) < 2:
+            estimated_points.append([x_tmp, y_tmp])
+            while x_tmp - best_board_width > 0:
+                x_tmp -= best_board_width
 
-        while y_tmp - best_board_width > 0:
-            y_tmp -= best_board_width
+            while y_tmp - best_board_width > 0:
+                y_tmp -= best_board_width
 
-        started_points.append([x_tmp, y_tmp])
+            started_points.append([x_tmp, y_tmp])
     start_x = sum([started_points[i][0] for i in range(len(started_points))]) / len(started_points)
     start_y = sum([started_points[i][1] for i in range(len(started_points))]) / len(started_points)
 
@@ -127,12 +151,17 @@ def patchify(checkerboard: np.ndarray) -> List:
             x_cent, y_cent = start_x + i * best_board_width, start_y + j * best_board_width
             # Get the refined coordination.
             x_cent, y_cent = get_estimated_center(x_cent, y_cent, estimated_points, best_board_width / 2)
+            if x_cent >= stone.shape[0] + 3 or y_cent >= stone.shape[1] + 3:
+                continue
             radius = int(best_board_width / 2)
-            cv2.circle(stone, (x_cent, y_cent), radius, (0, 0, 255), 3)
-            patches.append(stone[x_cent - radius:x_cent + radius, y_cent - radius:y_cent + radius])
+            cv2.circle(stone, (y_cent, x_cent), radius, (0, 0, 255), 3)
+
+            x_left, x_right = max(0, x_cent - radius), min(stone.shape[0], x_cent + radius)
+            y_left, y_right = max(0, y_cent - radius), min(stone.shape[1], y_cent + radius)
+            patches.append(checkerboard[x_left: x_right, y_left: y_right, :])
 
     for cir in circles:
-        cv2.circle(stone, (int(cir[0]), int(cir[1])), int(cir[2] - 5), (0, 255, 0), 3)
+        cv2.circle(stone, (int(cir[0]), int(cir[1])), int(cir[2]), (0, 255, 0), 3)
     plt.figure(figsize=(10, 10), dpi=80)
     plt.imshow(stone)
     plt.show()
@@ -147,5 +176,5 @@ def load_img(path: str):
 
 
 if __name__ == '__main__':
-    image = load_img("./data/97_board.png")
+    image = load_img("./data/1_board.png")
     segmented_patches = patchify(image)
